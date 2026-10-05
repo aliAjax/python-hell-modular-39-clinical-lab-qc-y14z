@@ -21,7 +21,18 @@ python3 app.py --db ./data.db --port 8339
 
 ## 核心对象
 
-`assay`为检测项目，`qc_lot`为质控品批次，`instrument`为仪器，`qc_run`为质控结果，`result_batch`为患者结果批次。
+`assay`为检测项目，`qc_lot`为质控品批次，`instrument`为仪器，`qc_run`为质控结果，`result_batch`为患者结果批次，`qc_review`为失控回顾范围。
+
+## 失控回顾
+
+`qc_run`评价为`rejected`时，系统会沿同一仪器、同一检测项目的质控时间线，以最近一次`accepted`质控为起点、本次失控为终点自动建立`qc_review`。范围内所有已`released`患者结果批次都会进入回顾清单；没有时间依据的旧记录按该结果批次记录的仪器/项目兼容关系纳入。
+
+两名主管对重叠区间（或同一次失控）重复建单时，SQLite事务只保留一个有效范围，后提交的单据置为`merged`并接续原范围。复核项使用：
+
+- `outcome: retain`：复核仍合格，患者批次保持`released`。
+- `outcome: recall`：受影响批次改为`recall_pending`。
+
+逐批次提交并记录检查点；`resume_review`会继续未完成的`pending`项，已处理项跳过，不重复改版本、状态或审计。也可直接调用`POST /api/qc_reviews`创建显式窗口（无失控质控时必须提供`start_at`、`end_at`）。
 
 ## 接口
 

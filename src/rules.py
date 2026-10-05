@@ -62,6 +62,87 @@ def unrecovered_rejection(batches):
     return [batch for batch in batches if batch.get("status") == "intercepted"]
 
 
+def previous_accepted_qc_run(qc_runs, failed_run):
+    """Return the latest accepted run for the same instrument and assay."""
+    instrument_id = failed_run["data"].get("instrument_id")
+    assay_id = failed_run["data"].get("assay_id")
+    failed_at = failed_run["data"].get("run_at") or failed_run.get("created_at")
+    accepted = []
+    for run in qc_runs or []:
+        if run["id"] == failed_run["id"] or run["status"] != "accepted":
+            continue
+        if run["data"].get("instrument_id") != instrument_id:
+            continue
+        if run["data"].get("assay_id") != assay_id:
+            continue
+        run_at = run["data"].get("run_at") or run.get("created_at")
+        if run_at and failed_at and str(run_at) < str(failed_at):
+            accepted.append(run)
+    if not accepted:
+        return None
+    return max(
+        accepted,
+        key=lambda run: (
+            str(run["data"].get("run_at") or run.get("created_at") or ""),
+            run["created_at"],
+            run["id"],
+        ),
+    )
+
+
+def intervals_overlap(start_one, end_one, start_two, end_two):
+    if None in (start_one, end_one, start_two, end_two):
+        return True
+    return str(start_one) < str(end_two) and str(end_one) > str(start_two)
+
+
+def merge_intervals(start_one, end_one, start_two, end_two):
+    starts = [item for item in (start_one, start_two) if item is not None]
+    ends = [item for item in (end_one, end_two) if item is not None]
+    if len(starts) != 2 or len(ends) != 2:
+        return None, None
+    return min(starts), max(ends)
+
+
+def batch_in_review_window(batch, instrument_id, assay_id, start_at, end_at):
+    data = batch.get("data") or {}
+    if data.get("instrument_id") != instrument_id or data.get("assay_id") != assay_id:
+        return False
+    run_at = data.get("run_at") or data.get("measured_at") or data.get("tested_at")
+    # Legacy records without a basis timestamp are located through the historical
+    # instrument/assay compatibility represented by the result batch itself.
+    if not run_at:
+        return True
+    if start_at is not None and str(run_at) <= str(start_at):
+        return False
+    if end_at is not None and str(run_at) > str(end_at):
+        return False
+    return True
+
+
+def retrospective_candidate_batches(batches, instrument_id, assay_id, start_at, end_at):
+    candidates = [
+        batch
+        for batch in batches or []
+        if batch.get("status") == "released"
+        and batch_in_review_window(batch, instrument_id, assay_id, start_at, end_at)
+    ]
+    return sorted(
+        candidates,
+        key=lambda batch: (
+            0 if (batch.get("data", {}).get("run_at") or batch.get("data", {}).get("measured_at") or batch.get("data", {}).get("tested_at")) else 1,
+            str(
+                batch.get("data", {}).get("run_at")
+                or batch.get("data", {}).get("measured_at")
+                or batch.get("data", {}).get("tested_at")
+                or batch.get("created_at")
+                or ""
+            ),
+            batch["id"],
+        ),
+    )
+
+
 def _validate_assay(actor, data, lookup):
     try:
         low = float(data.get("allowed_low"))
@@ -161,7 +242,7 @@ def _validate_release(actor, entity, data, lookup):
         raise ConflictError("instrument calibration is not valid at result time")
     active_holds = []
     for batch in lookup("result_batch", "instrument_id", entity["data"].get("instrument_id")) or []:
-        if batch["id"] != entity["id"] and batch["status"] == "intercepted":
+        if batch["id"] != entity["id"] and batch["status"] in ("intercepted", "recall_pending"):
             active_holds.append(batch)
     if active_holds:
         raise ConflictError("an intercepted result batch must be resolved first")
@@ -194,6 +275,49 @@ def _validate_correct(actor, entity, data, lookup):
     return {"correction_history": history}
 
 
+def _validate_qc_review(actor, data, lookup):
+    assay_id = data.get("assay_id")
+    instrument_id = data.get("instrument_id")
+    if not _find_one(lookup, "assay", "id", assay_id):
+        raise ValidationError("assay does not exist")
+    if not _find_one(lookup, "instrument", "id", instrument_id):
+        raise ValidationError("instrument does not exist")
+
+    start_at = data.get("start_at")
+    end_at = data.get("end_at")
+    failed_run = _find_one(lookup, "qc_run", "id", data.get("failed_qc_run_id"))
+    if failed_run:
+        if failed_run["status"] != "rejected":
+            raise ValidationError("failed QC run must be rejected")
+        if failed_run["data"].get("assay_id") != assay_id or failed_run["data"].get("instrument_id") != instrument_id:
+            raise ValidationError("failed QC run does not match assay and instrument")
+        failed_run_at = failed_run["data"].get("run_at") or failed_run.get("created_at")
+        end_at = end_at or failed_run_at
+        previous = previous_accepted_qc_run(lookup("qc_run", "instrument_id", instrument_id), failed_run)
+        start_at = start_at or (
+            previous["data"].get("run_at") if previous else None
+        )
+    else:
+        if start_at is None or end_at is None:
+            raise ValidationError("start_at and end_at are required without failed_qc_run_id")
+
+    if start_at is not None and end_at is not None and str(start_at) >= str(end_at):
+        raise ValidationError("review window start must be earlier than end")
+
+    candidates = retrospective_candidate_batches(
+        lookup("result_batch", "instrument_id", instrument_id),
+        instrument_id,
+        assay_id,
+        start_at,
+        end_at,
+    )
+    return {
+        "start_at": start_at,
+        "end_at": end_at,
+        "candidate_batch_ids": [batch["id"] for batch in candidates],
+    }
+
+
 class RuleEngine:
     ALIASES = {
         "assays": "assay",
@@ -201,6 +325,9 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "qc_reviews": "qc_review",
+        "out_of_control_reviews": "qc_review",
+        "out_of_control_review": "qc_review",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -208,6 +335,7 @@ class RuleEngine:
         "instrument": "ready",
         "qc_run": "pending",
         "result_batch": "waiting",
+        "qc_review": "processing",
     }
     TRANSITIONS = {
         "assay": {
@@ -236,10 +364,11 @@ class RuleEngine:
         "result_batch": {
             "release": (("waiting",), "released"),
             "intercept": (("waiting",), "intercepted"),
+            "flag_recall": (("released",), "recall_pending"),
             "retest": (("intercepted",), "waiting"),
             "investigate": (("intercepted",), "investigating"),
             "resolve": (("investigating",), "resolved"),
-            "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
+            "correct": (("waiting", "intercepted", "investigating", "released", "recall_pending", "resolved"), "waiting"),
         },
     }
     CREATE_REQUIRED = {
@@ -248,6 +377,7 @@ class RuleEngine:
         "instrument": ("name", "serial", "calibration_due"),
         "qc_run": ("assay_id", "qc_lot_id", "instrument_id", "value", "run_at"),
         "result_batch": ("assay_id", "instrument_id", "qc_run_id", "run_at", "patient_count"),
+        "qc_review": ("assay_id", "instrument_id"),
     }
     ACTION_REQUIRED = {
         ("assay", "suspend"): ("reason",),
@@ -264,6 +394,7 @@ class RuleEngine:
         ("qc_run", "correct"): ("reason", "value"),
         ("result_batch", "release"): ("reviewer_id",),
         ("result_batch", "intercept"): ("reason",),
+        ("result_batch", "flag_recall"): ("reason",),
         ("result_batch", "retest"): ("replacement_run_id", "reason"),
         ("result_batch", "investigate"): ("reason",),
         ("result_batch", "resolve"): ("resolution",),
@@ -275,6 +406,7 @@ class RuleEngine:
         "instrument": ("supervisor", "admin"),
         "qc_run": ("operator", "supervisor", "admin"),
         "result_batch": ("operator", "supervisor", "admin"),
+        "qc_review": ("supervisor", "admin"),
     }
     ROLE_ACTIONS = {
         "suspend": ("supervisor", "admin"),
@@ -292,6 +424,9 @@ class RuleEngine:
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
+        "flag_recall": ("supervisor", "admin"),
+        "review_batches": ("supervisor", "admin"),
+        "resume_review": ("supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "assay": _validate_assay,
@@ -299,6 +434,7 @@ class RuleEngine:
         "instrument": _validate_instrument,
         "qc_run": _validate_qc_run,
         "result_batch": _validate_result_batch,
+        "qc_review": _validate_qc_review,
     }
     CUSTOM_TRANSITIONS = {
         ("qc_run", "evaluate"): _validate_evaluate,
