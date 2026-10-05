@@ -194,6 +194,92 @@ def _validate_correct(actor, entity, data, lookup):
     return {"correction_history": history}
 
 
+def _run_order_key(run):
+    return (str(run["data"].get("run_at") or ""), str(run.get("created_at") or ""), run["id"])
+
+
+def lookback_window(lookup, instrument_id, assay_id, trigger_run_id):
+    """Compute the review window for a failed QC run.
+
+    The window starts at the last accepted QC run on the instrument for the
+    assay and ends at the failed (trigger) run. Released patient result
+    batches between the two are the review candidates. When timestamps are
+    missing the batches are located by instrument/assay compatibility
+    instead of time ordering ("按当时仪器兼容定位").
+    """
+    trigger = _find_one(lookup, "qc_run", "id", trigger_run_id)
+    if not trigger or trigger["kind"] != "qc_run":
+        raise ValidationError("trigger run does not exist")
+    if trigger["data"].get("instrument_id") != instrument_id:
+        raise ValidationError("trigger run does not belong to the instrument")
+    if trigger["data"].get("assay_id") != assay_id:
+        raise ValidationError("trigger run does not belong to the assay")
+    trigger_at = trigger["data"].get("run_at")
+
+    accepted = []
+    for run in lookup("qc_run", "instrument_id", instrument_id) or []:
+        if run["data"].get("assay_id") != assay_id:
+            continue
+        if run["status"] != "accepted":
+            continue
+        if trigger_at and run["data"].get("run_at") and str(run["data"]["run_at"]) >= str(trigger_at):
+            continue
+        accepted.append(run)
+    accepted.sort(key=_run_order_key)
+    last_accepted = accepted[-1] if accepted else None
+    last_at = last_accepted["data"].get("run_at") if last_accepted else None
+    legacy = not (trigger_at and last_at)
+
+    batches = []
+    for batch in lookup("result_batch", "instrument_id", instrument_id) or []:
+        if batch["data"].get("assay_id") != assay_id or batch["status"] != "released":
+            continue
+        linked = _find_one(lookup, "qc_run", "id", batch["data"].get("qc_run_id"))
+        compatible = bool(
+            linked
+            and linked["data"].get("instrument_id") == instrument_id
+            and linked["data"].get("assay_id") == assay_id
+        )
+        if not compatible:
+            continue
+        batch_at = batch["data"].get("run_at")
+        if trigger_at and last_at and batch_at:
+            in_window = str(last_at) < str(batch_at) <= str(trigger_at)
+        else:
+            # Legacy data without timestamps: locate by instrument compatibility.
+            in_window = True
+        if in_window:
+            batches.append(batch)
+    batches.sort(key=lambda b: (str(b["data"].get("run_at") or ""), str(b.get("created_at") or ""), b["id"]))
+    return {
+        "instrument_id": instrument_id,
+        "assay_id": assay_id,
+        "trigger_run_id": trigger_run_id,
+        "from_run_id": last_accepted["id"] if last_accepted else None,
+        "from_run_at": last_at,
+        "to_run_at": trigger_at,
+        "window_batches": [batch["id"] for batch in batches],
+        "legacy": legacy,
+    }
+
+
+def _validate_lookback(actor, data, lookup):
+    instrument = _find_one(lookup, "instrument", "id", data.get("instrument_id"))
+    if not instrument:
+        raise ValidationError("instrument does not exist")
+    trigger = _find_one(lookup, "qc_run", "id", data.get("trigger_run_id"))
+    if not trigger or trigger["kind"] != "qc_run":
+        raise ValidationError("trigger run does not exist")
+    if trigger["status"] != "rejected":
+        raise ValidationError("lookback requires a rejected QC run")
+    if trigger["data"].get("instrument_id") != instrument["id"]:
+        raise ValidationError("trigger run does not belong to the instrument")
+    assay_id = data.get("assay_id") or trigger["data"].get("assay_id")
+    if trigger["data"].get("assay_id") != assay_id:
+        raise ValidationError("trigger run does not belong to the assay")
+    return lookback_window(lookup, instrument["id"], assay_id, trigger["id"])
+
+
 class RuleEngine:
     ALIASES = {
         "assays": "assay",
@@ -201,6 +287,7 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "qc_lookbacks": "qc_lookback",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -208,6 +295,7 @@ class RuleEngine:
         "instrument": "ready",
         "qc_run": "pending",
         "result_batch": "waiting",
+        "qc_lookback": "open",
     }
     TRANSITIONS = {
         "assay": {
@@ -239,7 +327,11 @@ class RuleEngine:
             "retest": (("intercepted",), "waiting"),
             "investigate": (("intercepted",), "investigating"),
             "resolve": (("investigating",), "resolved"),
+            "recall": (("released",), "pending_recall"),
             "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
+        },
+        "qc_lookback": {
+            "process": (("open",), "open"),
         },
     }
     CREATE_REQUIRED = {
@@ -248,6 +340,7 @@ class RuleEngine:
         "instrument": ("name", "serial", "calibration_due"),
         "qc_run": ("assay_id", "qc_lot_id", "instrument_id", "value", "run_at"),
         "result_batch": ("assay_id", "instrument_id", "qc_run_id", "run_at", "patient_count"),
+        "qc_lookback": ("instrument_id", "trigger_run_id"),
     }
     ACTION_REQUIRED = {
         ("assay", "suspend"): ("reason",),
@@ -275,6 +368,7 @@ class RuleEngine:
         "instrument": ("supervisor", "admin"),
         "qc_run": ("operator", "supervisor", "admin"),
         "result_batch": ("operator", "supervisor", "admin"),
+        "qc_lookback": ("supervisor", "admin"),
     }
     ROLE_ACTIONS = {
         "suspend": ("supervisor", "admin"),
@@ -292,6 +386,8 @@ class RuleEngine:
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
+        "recall": ("supervisor", "admin"),
+        "process": ("supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "assay": _validate_assay,
@@ -299,6 +395,7 @@ class RuleEngine:
         "instrument": _validate_instrument,
         "qc_run": _validate_qc_run,
         "result_batch": _validate_result_batch,
+        "qc_lookback": _validate_lookback,
     }
     CUSTOM_TRANSITIONS = {
         ("qc_run", "evaluate"): _validate_evaluate,

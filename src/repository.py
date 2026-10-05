@@ -196,6 +196,163 @@ class SQLiteRepository:
                 (actor_id, idem_key, entity_id, utcnow()),
             )
 
+    def merge_open_lookback(self, instrument_id, assay_id, validated, actor_id):
+        """Merge a new lookback scope into the open one for the same instrument.
+
+        Returns the merged lookback, or None when no open lookback exists.
+        The window is widened to cover both scopes, overlapping batches are
+        de-duplicated, the checkpoint is preserved and the late reviewer is
+        added. Runs in one transaction so concurrent submissions keep a
+        single scope.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT * FROM entities WHERE kind = 'qc_lookback' AND status = 'open'"
+            ).fetchall()
+            row = None
+            for candidate in rows:
+                data = json.loads(candidate["data"])
+                if data.get("instrument_id") == instrument_id and data.get("assay_id") == assay_id:
+                    row = candidate
+                    break
+            if row is None:
+                connection.rollback()
+                return None
+            data = json.loads(row["data"])
+            if validated.get("from_run_at") and (
+                not data.get("from_run_at") or str(validated["from_run_at"]) < str(data["from_run_at"])
+            ):
+                data["from_run_at"] = validated["from_run_at"]
+                data["from_run_id"] = validated["from_run_id"]
+            if validated.get("to_run_at") and (
+                not data.get("to_run_at") or str(validated["to_run_at"]) > str(data["to_run_at"])
+            ):
+                data["to_run_at"] = validated["to_run_at"]
+                data["trigger_run_id"] = validated["trigger_run_id"]
+            seen = list(data.get("window_batches") or [])
+            for batch_id in validated.get("window_batches") or []:
+                if batch_id not in seen:
+                    seen.append(batch_id)
+            data["window_batches"] = seen
+            reviewers = list(data.get("reviewers") or [])
+            if actor_id not in reviewers:
+                reviewers.append(actor_id)
+            data["reviewers"] = reviewers
+            data["legacy"] = bool(data.get("legacy")) or bool(validated.get("legacy"))
+            payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "UPDATE entities SET data = ?, version = version + 1, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (payload, utcnow(), row["id"], row["version"]),
+            )
+            connection.commit()
+            merged = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (row["id"],)
+            ).fetchone()
+            return self._entity_from_row(merged) if merged else None
+
+    def apply_lookback_review(self, lookback_id, batch_id, outcome, actor_id, actor_role, recall):
+        """Apply the review result for one batch and advance the checkpoint.
+
+        The batch status change (when recalled) and the lookback checkpoint
+        update commit together. Already-processed batches are a no-op, so a
+        resumed run never re-modifies them.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (lookback_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("lookback not found: " + lookback_id)
+            data = json.loads(row["data"])
+            processed = dict(data.get("processed") or {})
+            if batch_id in processed:
+                connection.rollback()
+                return self._entity_from_row(row)
+            if recall:
+                batch = connection.execute(
+                    "SELECT * FROM entities WHERE id = ?", (batch_id,)
+                ).fetchone()
+                if batch and batch["status"] == "released":
+                    batch_data = json.loads(batch["data"])
+                    batch_data["recall"] = {
+                        "lookback_id": lookback_id,
+                        "actor_id": actor_id,
+                        "at": utcnow(),
+                    }
+                    connection.execute(
+                        "UPDATE entities SET status = 'pending_recall', version = version + 1, "
+                        "data = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(batch_data, ensure_ascii=False, sort_keys=True), utcnow(), batch_id),
+                    )
+                    connection.execute(
+                        "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, "
+                        "to_status, detail, created_at) VALUES (?, ?, ?, 'recall', 'released', "
+                        "'pending_recall', ?, ?)",
+                        (
+                            batch_id,
+                            actor_id,
+                            actor_role,
+                            json.dumps({"lookback_id": lookback_id, "outcome": outcome}, sort_keys=True),
+                            utcnow(),
+                        ),
+                    )
+            processed[batch_id] = outcome
+            data["processed"] = processed
+            window = list(data.get("window_batches") or [])
+            completed = bool(window) and all(batch in processed for batch in window)
+            new_status = "completed" if completed else row["status"]
+            payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ?",
+                (new_status, payload, utcnow(), lookback_id),
+            )
+            connection.execute(
+                "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, "
+                "to_status, detail, created_at) VALUES (?, ?, ?, 'process', ?, ?, ?, ?)",
+                (
+                    lookback_id,
+                    actor_id,
+                    actor_role,
+                    row["status"],
+                    new_status,
+                    json.dumps({"batch_id": batch_id, "outcome": outcome}, sort_keys=True),
+                    utcnow(),
+                ),
+            )
+            connection.commit()
+            updated = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (lookback_id,)
+            ).fetchone()
+            return self._entity_from_row(updated) if updated else None
+
+    def complete_lookback(self, lookback_id):
+        """Mark a lookback completed once every window batch has an outcome."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (lookback_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("lookback not found: " + lookback_id)
+            data = json.loads(row["data"])
+            processed = dict(data.get("processed") or {})
+            window = list(data.get("window_batches") or [])
+            if all(batch in processed for batch in window):
+                connection.execute(
+                    "UPDATE entities SET status = 'completed', version = version + 1, updated_at = ? "
+                    "WHERE id = ?",
+                    (utcnow(), lookback_id),
+                )
+            connection.commit()
+            updated = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (lookback_id,)
+            ).fetchone()
+            return self._entity_from_row(updated) if updated else None
+
     def ping(self):
         with self._connect() as connection:
             connection.execute("SELECT 1").fetchone()
